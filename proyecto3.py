@@ -3,123 +3,129 @@ import sys
 import glob
 import cv2
 import numpy as np
+import matplotlib.pyplot as plt
+
+# -----------------------------
+# Parámetros globales
+# -----------------------------
+RESIZE_DIM = (480, 320)
+RATIO_TEST = 0.75
+REPROJ_THRESH = 4.0
+DETECTOR_TYPE = 'ORB'   # Elige entre 'ORB', 'SIFT'
+NFEATURES = 2000       # Número de características para ORB
+
+# Mostrar imágenes con matplotlib
+def show_image(img, title=None):
+    if img is None:
+        return
+    if len(img.shape) == 3 and img.shape[2] == 3:
+        display = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    else:
+        display = img
+    plt.figure(figsize=(10,6))
+    if title: plt.title(title)
+    plt.axis('off')
+    plt.imshow(display)
+    plt.show()
 
 class Matcher:
-    def __init__(self):
-        self.detector = cv2.ORB_create(nfeatures=2000)
-        self.bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
+    def __init__(self, detector_type=DETECTOR_TYPE, nfeatures=NFEATURES):
+        # Configurar detector y medida de distancia
+        if detector_type == 'SIFT':
+            self.detector = cv2.SIFT_create()
+            norm = cv2.NORM_L2
+        else:
+            self.detector = cv2.ORB_create(nfeatures=nfeatures)
+            norm = cv2.NORM_HAMMING
+        self.matcher = cv2.BFMatcher(norm, crossCheck=False)
 
-    def match(self, img1, img2, direction=None):
-        set1 = self.getFeatures(img1)
-        set2 = self.getFeatures(img2)
-        print(f"Matching direction: {direction}")
-        matches = self.bf.knnMatch(
-            set2['des'],
-            set1['des'],
-            k=2
-        )
-        good = []
-        for m, n in matches:
-            if m.distance < 0.75 * n.distance:
-                good.append((m.trainIdx, m.queryIdx))
-        if len(good) > 4:
-            pts2 = np.float32([set2['kp'][j].pt for (_, j) in good]).reshape(-1,1,2)
-            pts1 = np.float32([set1['kp'][i].pt for (i, _) in good]).reshape(-1,1,2)
-            H, _ = cv2.findHomography(pts2, pts1, cv2.RANSAC, 4.0)
-            return H
-        return None
-
-    def getFeatures(self, img):
+    def get_feats(self, img):
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         kp, des = self.detector.detectAndCompute(gray, None)
-        return {'kp': kp, 'des': des}
+        return kp, des
 
+    def match_and_show(self, imgA, imgB, tag):
+        # Extraer y visualizar keypoints
+        kpA, desA = self.get_feats(imgA)
+        kpB, desB = self.get_feats(imgB)
+        show_image(cv2.drawKeypoints(imgA, kpA, None,
+                     flags=cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS), f'Keypoints {tag} A')
+        show_image(cv2.drawKeypoints(imgB, kpB, None,
+                     flags=cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS), f'Keypoints {tag} B')
+        # Matching con ratio test
+        raw = self.matcher.knnMatch(desA, desB, k=2)
+        good = [m for m,n in raw if m.distance < RATIO_TEST * n.distance]
+        show_image(cv2.drawMatches(imgA, kpA, imgB, kpB, good, None, flags=2),
+                   f'Matches pre RANSAC {tag}')
+        if len(good) < 4:
+            print(f'No suficientes matches para {tag}')
+            return None
+        ptsA = np.float32([kpA[m.queryIdx].pt for m in good]).reshape(-1,1,2)
+        ptsB = np.float32([kpB[m.trainIdx].pt for m in good]).reshape(-1,1,2)
+        H, mask = cv2.findHomography(ptsB, ptsA, cv2.RANSAC, REPROJ_THRESH)
+        inliers = [good[i] for i in range(len(good)) if mask.ravel()[i]]
+        show_image(cv2.drawMatches(imgA, kpA, imgB, kpB, inliers, None, flags=2),
+                   f'Inliers {tag}')
+        return H
 
-class Stitch:
-    def __init__(self, image_paths):
-        self.matcher = Matcher()
+class Stitcher:
+    def __init__(self, paths):
         self.images = []
-        for path in image_paths:
-            img = cv2.imread(path)
-            if img is None:
-                print(f"Warning: could not read {path}")
-                continue
-            img = cv2.resize(img, (480, 320))
-            self.images.append(img)
-        self.count = len(self.images)
-        if self.count == 0:
-            raise ValueError("No valid images to stitch.")
-        self.left_list = []
-        self.right_list = []
-        self.prepare_lists()
+        for p in sorted(paths):
+            img = cv2.imread(p)
+            if img is not None:
+                self.images.append(cv2.resize(img, RESIZE_DIM))
+        if not self.images:
+            raise RuntimeError('No hay imágenes válidas en el directorio')
+        mid = len(self.images) // 2
+        self.base = self.images[mid]
+        self.left = list(reversed(self.images[:mid]))
+        self.right = self.images[mid+1:]
+        self.matcher = Matcher()
 
-    def prepare_lists(self):
-        print(f"Total images: {self.count}")
-        centerIdx = self.count // 2
-        print(f"Center index: {centerIdx}")
-        for idx, img in enumerate(self.images):
-            if idx <= centerIdx:
-                self.left_list.append(img)
-            else:
-                self.right_list.append(img)
-        print("Prepared left and right lists.")
+    def warp_blend(self, panoramica, img, H, tag):
+        # Calcular nuevo lienzo
+        hP, wP = panoramica.shape[:2]
+        hI, wI = img.shape[:2]
+        corners = np.float32([[0,0],[wI,0],[wI,hI],[0,hI]]).reshape(-1,1,2)
+        warped_corners = cv2.perspectiveTransform(corners, H)
+        all_pts = np.vstack((np.float32([[0,0],[wP,0],[wP,hP],[0,hP]]).reshape(-1,1,2), warped_corners))
+        xmin, ymin = np.int32(all_pts.min(axis=0).ravel() - 0.5)
+        xmax, ymax = np.int32(all_pts.max(axis=0).ravel() + 0.5)
+        T = np.array([[1,0,-xmin],[0,1,-ymin],[0,0,1]], dtype=np.float64)
+        size = (xmax-xmin, ymax-ymin)
+        # Warpear y mostrar
+        pan_w = cv2.warpPerspective(panoramica, T, size)
+        img_w = cv2.warpPerspective(img, T.dot(H), size)
+        show_image(pan_w, f'Warp panoramica {tag}')
+        show_image(img_w, f'Warp imagen {tag}')
+        # Blending simple (pixel > 0)
+        mask = img_w > 0
+        merged = pan_w.copy()
+        merged[mask] = img_w[mask]
+        show_image(merged, f'Blend {tag}')
+        return merged
 
-    def leftshift(self):
-        a = self.left_list[0]
-        for b in self.left_list[1:]:
-            H = self.matcher.match(a, b, 'left')
-            if H is None:
-                continue
-            xh = np.linalg.inv(H)
-            f1 = xh.dot(np.array([0, 0, 1]))
-            f1 /= f1[-1]
-            xh[0, -1] += abs(int(f1[0]))
-            xh[1, -1] += abs(int(f1[1]))
-            ds = xh.dot(np.array([a.shape[1], a.shape[0], 1]))
-            ds /= ds[-1]
-            dsize = (int(ds[0]) + abs(int(f1[0])), int(ds[1]) + abs(int(f1[1])))
-            tmp = cv2.warpPerspective(a, xh, dsize)
-            tmp[abs(int(f1[1])):b.shape[0]+abs(int(f1[1])), abs(int(f1[0])):b.shape[1]+abs(int(f1[0]))] = b
-            a = tmp
-        self.leftImage = a
-        print("Left shift complete.")
-
-    def rightshift(self):
-        for img in self.right_list:
-            H = self.matcher.match(self.leftImage, img, 'right')
-            if H is None:
-                continue
-            txyz = H.dot(np.array([img.shape[1], img.shape[0], 1]))
-            txyz /= txyz[-1]
-            dsize = (int(txyz[0]) + self.leftImage.shape[1], int(txyz[1]) + self.leftImage.shape[0])
-            warped = cv2.warpPerspective(img, H, dsize)
-            self.leftImage = self.mix_and_match(self.leftImage, warped)
-        print("Right shift complete.")
-
-    def mix_and_match(self, base, warped):
-        h, w = base.shape[:2]
-        for y in range(h):
-            for x in range(w):
-                if np.array_equal(warped[y, x], [0, 0, 0]):
-                    warped[y, x] = base[y, x]
-        return warped
-
+    def stitch(self):
+        # Comenzar con la imagen base
+        panoramica = self.base.copy()
+        # Extender a la derecha
+        for idx, img in enumerate(self.right):
+            H = self.matcher.match_and_show(panoramica, img, f'D{idx}')
+            if H is not None:
+                panoramica = self.warp_blend(panoramica, img, H, f'D{idx}')
+        # Extender a la izquierda
+        for idx, img in enumerate(self.left):
+            H = self.matcher.match_and_show(panoramica, img, f'I{idx}')
+            if H is not None:
+                panoramica = self.warp_blend(panoramica, img, H, f'I{idx}')
+        return panoramica
 
 if __name__ == '__main__':
-    image_dir = os.path.join(os.path.dirname(__file__), 'imagenes')
-    exts = ['*.jpg', '*.jpeg', '*.png']
+    dir_img = os.path.join(os.path.dirname(__file__), 'imagenes')
     paths = []
-    for ext in exts:
-        paths.extend(glob.glob(os.path.join(image_dir, ext)))
-    paths.sort()
-    if not paths:
-        print(f"No images found in {image_dir}")
-        sys.exit(1)
-
-    stitcher = Stitch(paths)
-    stitcher.leftshift()
-    stitcher.rightshift()
-
-    out = 'panorama_result.jpg'
-    cv2.imwrite(out, stitcher.leftImage)
-    print(f"Panorama saved to {out}")
+    for ext in ['*.jpg', '*.jpeg', '*.png']:
+        paths.extend(glob.glob(os.path.join(dir_img, ext)))
+    stitcher = Stitcher(paths)
+    panoramica = stitcher.stitch()
+    show_image(panoramica, 'Panoramica Final')
